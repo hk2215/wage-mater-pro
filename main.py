@@ -3,7 +3,10 @@ import time
 import threading
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+
+# ★ 日本時間（JST）を定義
+JST = timezone(timedelta(hours=9), 'JST')
 
 # データを保存するファイル名
 DATA_FILE = "time_wage_data.json"
@@ -129,7 +132,7 @@ def main(page: ft.Page):
         start_ts = state["last_time"]
         total_add = 0.0
         for i in range(int(delta)):
-            current_time = datetime.fromtimestamp(start_ts + i).time()
+            current_time = datetime.fromtimestamp(start_ts + i , JST).time()
             wage = get_wage_at_time(current_time, base, bonuses)
             total_add += (wage / 3600)
             
@@ -164,7 +167,7 @@ def main(page: ft.Page):
             
         earned = state["accumulated_earned"]
         if earned > 0:
-            today = datetime.now().strftime("%Y-%m-%d")
+            today = datetime.now(JST).strftime("%Y-%m-%d")
             logs[today] = logs.get(today, 0) + int(earned)
         
         state.update({"running": False, "last_time": None, "accumulated_seconds": 0.0, "accumulated_earned": 0.0})
@@ -199,7 +202,7 @@ def main(page: ft.Page):
                 mins, secs = divmod(rem, 60)
                 timer_text.value = f"{hrs:02d}:{mins:02d}:{secs:02d}"
                 
-                current_time = datetime.now().time()
+                current_time = datetime.now(JST).time()
                 current_wage = get_wage_at_time(current_time, settings["base_wage"], get_parsed_bonuses())
                 current_wage_text.value = f"現在の時給: ¥ {int(current_wage):,}"
                 
