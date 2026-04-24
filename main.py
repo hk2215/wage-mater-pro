@@ -18,12 +18,13 @@ DATA_FILE = "time_wage_data.json"
 def load_db():
     default_db = {
         "settings": {
-            "base_wage": 1200.0, 
+            "base_wage": 1175.0, 
             "target_amount": 5000.0,
             "pay_period_start": 11,
             "bonuses": [
-                {"start": "18:00", "end": "20:00", "amt": 20.0},
-                {"start": "20:00", "end": "22:00", "amt": 30.0}
+                {"start": "16:00", "end": "18:00", "amt": 20.0},
+                {"start": "18:00", "end": "20:00", "amt": 30.0},
+                {"start": "20:00", "end": "22:00", "amt": 50.0}
             ]
         },
         "state": {
