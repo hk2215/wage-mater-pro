@@ -3,10 +3,8 @@ import time
 import threading
 import json
 import os
-from datetime import datetime, timezone, timedelta
-
-# ★ 日本時間（JST）を定義
-JST = timezone(timedelta(hours=9), 'JST')
+import calendar
+from datetime import datetime, timedelta
 
 # データを保存するファイル名
 DATA_FILE = "time_wage_data.json"
@@ -19,7 +17,7 @@ def load_db():
         "settings": {
             "base_wage": 1200.0, 
             "target_amount": 5000.0,
-            # ★ 加算枠をリスト形式に変更（何個でも追加可能に）
+            "pay_period_start": 11,
             "bonuses": [
                 {"start": "18:00", "end": "20:00", "amt": 20.0},
                 {"start": "20:00", "end": "22:00", "amt": 30.0}
@@ -28,8 +26,10 @@ def load_db():
         "state": {
             "running": False, 
             "last_time": None, 
+            "start_time_display": "", 
             "accumulated_seconds": 0.0, 
-            "accumulated_earned": 0.0
+            "accumulated_earned": 0.0,
+            "view_month_offset": 0
         },
         "logs": {}
     }
@@ -39,22 +39,18 @@ def load_db():
             with open(DATA_FILE, "r", encoding="utf-8") as f:
                 loaded_db = json.load(f)
                 
-                # 古いバージョンの設定データ（b1_start等）がある場合、新しいリスト形式に自動変換
                 loaded_settings = loaded_db.get("settings", {})
-                if "b1_start" in loaded_settings:
-                    bonuses = []
-                    if loaded_settings.get("b1_start"):
-                        bonuses.append({"start": loaded_settings["b1_start"], "end": loaded_settings["b1_end"], "amt": loaded_settings.get("b1_amt", 0)})
-                    if loaded_settings.get("b2_start"):
-                        bonuses.append({"start": loaded_settings["b2_start"], "end": loaded_settings["b2_end"], "amt": loaded_settings.get("b2_amt", 0)})
-                    loaded_settings["bonuses"] = bonuses
-                    # 古いキーを削除
-                    for key in ["b1_start", "b1_end", "b1_amt", "b2_start", "b2_end", "b2_amt"]:
-                        loaded_settings.pop(key, None)
-
                 default_db["settings"].update(loaded_settings)
                 default_db["state"].update(loaded_db.get("state", {}))
-                default_db["logs"] = loaded_db.get("logs", {})
+                
+                raw_logs = loaded_db.get("logs", {})
+                converted_logs = {}
+                for k, v in raw_logs.items():
+                    if isinstance(v, (int, float)):
+                        converted_logs[k] = [{"start": "不明", "end": "不明", "earned": int(v)}]
+                    else:
+                        converted_logs[k] = v
+                default_db["logs"] = converted_logs
                 return default_db
         except Exception:
             pass
@@ -79,6 +75,9 @@ def main(page: ft.Page):
     state = db["state"]
     logs = db["logs"]
 
+    if "view_month_offset" not in state:
+        state["view_month_offset"] = 0
+
     def show_msg(msg):
         snack = ft.SnackBar(content=ft.Text(msg))
         page.overlay.append(snack)
@@ -88,7 +87,12 @@ def main(page: ft.Page):
     # --- UIパーツ ---
     amount_text = ft.Text("¥ 0", size=65, weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_800)
     timer_text = ft.Text("00:00:00", size=20, color=ft.Colors.GREY_700)
+    start_time_label = ft.Text(f"開始時刻: {state['start_time_display']}" if state['start_time_display'] else "", size=14, color=ft.Colors.GREY_500)
+    
     current_wage_text = ft.Text("現在の時給: ¥ ---", size=14, color=ft.Colors.ORANGE_600, weight=ft.FontWeight.BOLD)
+    current_wage_min_text = ft.Text("分給: ¥ ---", size=12, color=ft.Colors.GREY_500)
+    current_wage_sec_text = ft.Text("秒給: ¥ ---", size=12, color=ft.Colors.GREY_500)
+    
     progress_ring = ft.ProgressRing(value=0, width=250, height=250, stroke_width=10, color=ft.Colors.BLUE)
 
     btn_start = ft.Button("開始", icon=ft.Icons.PLAY_ARROW, disabled=state["running"], style=ft.ButtonStyle(bgcolor=ft.Colors.GREEN_600, color=ft.Colors.WHITE))
@@ -119,35 +123,95 @@ def main(page: ft.Page):
                     wage += amt
         return wage
 
+    # ★ タイマーが死なないための安全対策（レースコンディション対策）
     def add_earned_time(now_t):
-        if state.get("last_time") is None:
+        last = state.get("last_time")
+        if last is None:
             return
-        delta = now_t - state["last_time"]
+        
+        delta = now_t - last
         if delta <= 0:
             return
             
         base = settings["base_wage"]
         bonuses = get_parsed_bonuses()
         
-        start_ts = state["last_time"]
         total_add = 0.0
-        for i in range(int(delta)):
-            current_time = datetime.fromtimestamp(start_ts + i , JST).time()
-            wage = get_wage_at_time(current_time, base, bonuses)
-            total_add += (wage / 3600)
+        # ★ もし1日以上(86400秒)放置された場合、計算が重くなりすぎないよう簡略化する保護機能
+        if delta > 86400:
+            total_add = (base / 3600) * delta
+        else:
+            start_ts = last
+            for i in range(int(delta)):
+                try:
+                    current_time = datetime.fromtimestamp(start_ts + i).time()
+                    wage = get_wage_at_time(current_time, base, bonuses)
+                    total_add += (wage / 3600)
+                except Exception:
+                    pass
+            rem = delta - int(delta)
+            total_add += (base / 3600) * rem
             
-        rem = delta - int(delta)
-        total_add += (base / 3600) * rem
-        
         state["accumulated_earned"] += total_add
         state["accumulated_seconds"] += delta
-        state["last_time"] = now_t
+        
+        # 処理の間に「一時停止」が押されてNoneになっていない場合のみ時間を更新
+        if state.get("last_time") is not None:
+            state["last_time"] = now_t
+
+    def get_period_dates(offset=0):
+        start_day = int(settings.get("pay_period_start", 11))
+        now = datetime.now()
+        base_month = now.month if now.day >= start_day else now.month - 1
+        base_year = now.year
+        if base_month == 0:
+            base_month = 12
+            base_year -= 1
+
+        total_months = base_year * 12 + (base_month - 1) + offset
+        target_year = total_months // 12
+        target_month = (total_months % 12) + 1
+
+        next_total_months = total_months + 1
+        next_year = next_total_months // 12
+        next_month = (next_total_months % 12) + 1
+        
+        def safe_date(y, m, d):
+            _, max_d = calendar.monthrange(y, m)
+            return datetime(y, m, min(d, max_d))
+            
+        s_date = safe_date(target_year, target_month, start_day)
+        n_date = safe_date(next_year, next_month, start_day)
+        e_date = n_date - timedelta(days=1)
+        
+        return s_date, e_date
+
+    def get_fallback_seconds(start_str, end_str):
+        if not start_str or not end_str or start_str == "不明" or end_str == "不明":
+            return 0.0
+        try:
+            s_dt = datetime.strptime(start_str, "%H:%M")
+            e_dt = datetime.strptime(end_str, "%H:%M")
+            if e_dt <= s_dt:
+                e_dt += timedelta(days=1)
+            return (e_dt - s_dt).total_seconds()
+        except:
+            return 0.0
+
+    def format_time_str(total_sec):
+        total_m = int(round(total_sec / 60))
+        h = total_m // 60
+        m = total_m % 60
+        return f"{h}時間{m}分"
 
     # --- ロジック ---
     def toggle_timer(is_start):
         now_t = time.time()
         if is_start:
             state["last_time"] = now_t
+            if not state["start_time_display"]:
+                state["start_time_display"] = datetime.now().strftime("%H:%M")
+                start_time_label.value = f"開始時刻: {state['start_time_display']}"
         else:
             add_earned_time(now_t)
             state["last_time"] = None
@@ -158,86 +222,98 @@ def main(page: ft.Page):
         btn_pause.disabled = not is_start
         page.update()
 
-    btn_start.on_click = lambda e: toggle_timer(True)
-    btn_pause.on_click = lambda e: toggle_timer(False)
-
     def finish_session(e):
         if state["running"]:
             add_earned_time(time.time())
-            
         earned = state["accumulated_earned"]
         if earned > 0:
-            today = datetime.now(JST).strftime("%Y-%m-%d")
-            logs[today] = logs.get(today, 0) + int(earned)
-        
-        state.update({"running": False, "last_time": None, "accumulated_seconds": 0.0, "accumulated_earned": 0.0})
+            today = datetime.now().strftime("%Y-%m-%d")
+            if today not in logs or not isinstance(logs[today], list):
+                logs[today] = []
+            logs[today].append({
+                "start": state["start_time_display"] or "不明",
+                "end": datetime.now().strftime("%H:%M"),
+                "earned": int(earned),
+                "seconds": state["accumulated_seconds"]
+            })
+        state.update({"running": False, "last_time": None, "start_time_display": "", "accumulated_seconds": 0.0, "accumulated_earned": 0.0})
+        start_time_label.value = ""
         save_db(db)
-        
         btn_start.disabled = False
         btn_pause.disabled = True
-        show_msg("本日の収入を記録しました！お疲れ様です。")
+        show_msg("勤務を記録しました！")
         page.update()
-
+    btn_start.on_click = lambda e: toggle_timer(True)
+    btn_pause.on_click = lambda e: toggle_timer(False)
     btn_finish.on_click = finish_session
 
     def clear_logs(e):
         db["logs"] = {}
         logs.clear()
         save_db(db)
-        show_msg("履歴を削除しました")
+        show_msg("履歴をすべて削除しました")
         page.run_task(page.push_route, "/")
 
-    # --- タイマースレッド ---
+    # --- ★ 無敵化されたタイマースレッド ---
     def update_timer():
         while True:
-            if state["running"]:
-                add_earned_time(time.time())
-
-            if page.route == "/" or page.route == "":
-                earned = state["accumulated_earned"]
-                amount_text.value = f"¥ {int(earned)}"
-                
-                total_sec = state["accumulated_seconds"]
-                hrs, rem = divmod(int(total_sec), 3600)
-                mins, secs = divmod(rem, 60)
-                timer_text.value = f"{hrs:02d}:{mins:02d}:{secs:02d}"
-                
-                current_time = datetime.now(JST).time()
-                current_wage = get_wage_at_time(current_time, settings["base_wage"], get_parsed_bonuses())
-                current_wage_text.value = f"現在の時給: ¥ {int(current_wage):,}"
-                
-                target = settings["target_amount"]
-                progress_ring.value = min(earned / target, 1.0) if target > 0 else 0
-                
-                try:
+            # 全体を try-except で囲み、絶対にスレッドが死なないようにする
+            try:
+                if state["running"]:
+                    add_earned_time(time.time())
+                    
+                if page.route == "/" or page.route == "":
+                    earned = state["accumulated_earned"]
+                    amount_text.value = f"¥ {int(earned)}"
+                    
+                    total_sec = state["accumulated_seconds"]
+                    hrs, rem = divmod(int(total_sec), 3600)
+                    mins, secs = divmod(rem, 60)
+                    timer_text.value = f"{hrs:02d}:{mins:02d}:{secs:02d}"
+                    
+                    current_time = datetime.now().time()
+                    current_wage = get_wage_at_time(current_time, settings["base_wage"], get_parsed_bonuses())
+                    
+                    current_wage_text.value = f"現在の時給: ¥ {int(current_wage):,}"
+                    current_wage_min_text.value = f"分給: ¥ {current_wage / 60:.1f}"
+                    current_wage_sec_text.value = f"秒給: ¥ {current_wage / 3600:.2f}"
+                    
+                    target = settings["target_amount"]
+                    progress_ring.value = min(earned / target, 1.0) if target > 0 else 0
+                    
+                    # UIの更新でエラーが起きても無視する
                     page.update()
-                except Exception:
-                    pass
-                
+            except Exception as ex:
+                pass
             time.sleep(1)
 
-    # --- 設定メニュー (Drawer) 動的構築 ---
+    # --- 設定メニュー ---
     wage_input = ft.TextField(label="基本時給 (円)", value=str(int(settings["base_wage"])), keyboard_type=ft.KeyboardType.NUMBER)
     target_input = ft.TextField(label="1日の目標金額 (円)", value=str(int(settings["target_amount"])), keyboard_type=ft.KeyboardType.NUMBER)
+    pay_period_input = ft.TextField(label="給料の開始日 (毎月◯日)", value=str(int(settings.get("pay_period_start", 11))), keyboard_type=ft.KeyboardType.NUMBER)
     
-    # 動的に追加・削除されるUIパーツを管理するリスト
     bonus_ui_items = []
     bonus_list_column = ft.Column(spacing=15)
 
     def create_time_btn(default_time):
         t_text = ft.Text(default_time, size=16, weight=ft.FontWeight.BOLD)
-        def on_time_picked(e):
+        def on_change_time(e):
             if e.control.value:
                 t_text.value = e.control.value.strftime("%H:%M")
                 page.update()
-        picker = ft.TimePicker(confirm_text="決定", cancel_text="キャンセル", error_invalid_text="時間が無効です", on_change=on_time_picked)
+                
+        # ここでも entry_mode=ft.TimePickerEntryMode.INPUT が機能し、キーボード入力が優先されます
+        picker = ft.TimePicker(
+            confirm_text="決定", 
+            cancel_text="キャンセル", 
+            entry_mode=ft.TimePickerEntryMode.INPUT, 
+            on_change=on_change_time
+        )
         page.overlay.append(picker)
-        def show_picker(e):
-            picker.open = True
-            page.update()
         btn = ft.TextButton(
-            content=ft.Row([ft.Icon(ft.Icons.ACCESS_TIME, size=18, color=ft.Colors.BLUE_600), t_text], spacing=5),
-            on_click=show_picker, style=ft.ButtonStyle(padding=5)
+            content=ft.Row([ft.Icon(ft.Icons.ACCESS_TIME, size=18, color=ft.Colors.BLUE_600), t_text], spacing=5), 
+            on_click=lambda _: setattr(picker, 'open', True) or page.update(), 
+            style=ft.ButtonStyle(padding=5)
         )
         return btn, t_text
 
@@ -245,110 +321,170 @@ def main(page: ft.Page):
         btn_start, txt_start = create_time_btn(start_val)
         btn_end, txt_end = create_time_btn(end_val)
         tf_amt = ft.TextField(label="加算額(円)", value=str(int(amt_val)), width=100, keyboard_type=ft.KeyboardType.NUMBER)
-        
-        item = {
-            "btn_start": btn_start, "txt_start": txt_start,
-            "btn_end": btn_end, "txt_end": txt_end,
-            "tf_amt": tf_amt
-        }
+        item = {"btn_start": btn_start, "txt_start": txt_start, "btn_end": btn_end, "txt_end": txt_end, "tf_amt": tf_amt}
         bonus_ui_items.append(item)
         refresh_bonus_ui()
-
-    def delete_bonus_row(item):
-        if item in bonus_ui_items:
-            bonus_ui_items.remove(item)
-            refresh_bonus_ui()
 
     def refresh_bonus_ui():
         bonus_list_column.controls.clear()
         for i, item in enumerate(bonus_ui_items):
-            header = ft.Row([
-                ft.Text(f"時間帯加算 {i+1}", size=16, weight=ft.FontWeight.BOLD),
-                ft.IconButton(icon=ft.Icons.DELETE_OUTLINE, icon_color=ft.Colors.RED_400, on_click=lambda e, it=item: delete_bonus_row(it))
-            ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN)
-            
+            header = ft.Row([ft.Text(f"時間帯加算 {i+1}", size=16, weight=ft.FontWeight.BOLD), ft.IconButton(icon=ft.Icons.DELETE_OUTLINE, icon_color=ft.Colors.RED_400, on_click=lambda e, it=item: (bonus_ui_items.remove(it), refresh_bonus_ui()))], alignment=ft.MainAxisAlignment.SPACE_BETWEEN)
             row_times = ft.Row([item["btn_start"], ft.Text("〜"), item["btn_end"]])
             row_amt = ft.Row([item["tf_amt"], ft.Text("円アップ")])
-            
-            card = ft.Container(
-                content=ft.Column([header, row_times, row_amt], spacing=5),
-                padding=10, border=ft.border.all(1, ft.Colors.GREY_300), border_radius=8
-            )
+            card = ft.Container(content=ft.Column([header, row_times, row_amt], spacing=5), padding=10, border=ft.border.all(1, ft.Colors.GREY_300), border_radius=8)
             bonus_list_column.controls.append(card)
-        
-        if page.route:  # 初期化時以外は画面を更新する
-            page.update()
+        if page.route: page.update()
 
-    # 起動時にデータベースのリストからUIを復元
-    for b in settings.get("bonuses", []):
-        add_bonus_row(b.get("start", "18:00"), b.get("end", "20:00"), b.get("amt", 0.0))
-
+    for b in settings.get("bonuses", []): add_bonus_row(b.get("start", "18:00"), b.get("end", "20:00"), b.get("amt", 0.0))
     btn_add_bonus = ft.TextButton("＋ 新しい加算枠を追加", icon=ft.Icons.ADD, on_click=lambda e: add_bonus_row())
 
     def save_settings(e):
         try:
             settings["base_wage"] = float(wage_input.value)
             settings["target_amount"] = float(target_input.value)
-            
-            # UIの入力内容から新しいリストを作成して保存
-            settings["bonuses"] = []
-            for item in bonus_ui_items:
-                amt = float(item["tf_amt"].value) if item["tf_amt"].value else 0.0
-                settings["bonuses"].append({
-                    "start": item["txt_start"].value,
-                    "end": item["txt_end"].value,
-                    "amt": amt
-                })
-            
+            settings["pay_period_start"] = int(pay_period_input.value)
+            settings["bonuses"] = [{"start": item["txt_start"].value, "end": item["txt_end"].value, "amt": float(item["tf_amt"].value) if item["tf_amt"].value else 0.0} for item in bonus_ui_items]
             save_db(db)
             page.run_task(page.close_drawer)
             show_msg("設定を保存しました")
             page.update()
-        except ValueError:
-            show_msg("正しい数値を入力してください")
+        except ValueError: show_msg("正しい数値を入力してください")
 
-    my_drawer = ft.NavigationDrawer(
-        controls=[
-            ft.Container(
-                content=ft.Column([
-                    ft.Text("各種設定", size=22, weight=ft.FontWeight.BOLD),
-                    wage_input,
-                    target_input,
-                    ft.Divider(),
-                    bonus_list_column, # 動的リスト
-                    btn_add_bonus,
-                    ft.Divider(),
-                    ft.Button("設定を保存", on_click=save_settings, style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE, color=ft.Colors.WHITE)),
-                ], spacing=10, scroll=ft.ScrollMode.AUTO),
-                padding=20, expand=True
-            )
-        ]
+    my_drawer = ft.NavigationDrawer(controls=[ft.Container(content=ft.Column([ft.Text("各種設定", size=22, weight=ft.FontWeight.BOLD), wage_input, target_input, pay_period_input, ft.Divider(), bonus_list_column, btn_add_bonus, ft.Divider(), ft.Button("設定を保存", on_click=save_settings, style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE, color=ft.Colors.WHITE))], spacing=10, scroll=ft.ScrollMode.AUTO), padding=20, expand=True)])
+
+    # --- 過去のシフトを手動で追加（修正版） ---
+    txt_m_date = ft.Text(datetime.now().strftime("%Y-%m-%d"), size=16, weight=ft.FontWeight.BOLD)
+    txt_m_start = ft.Text("16:00", size=16, weight=ft.FontWeight.BOLD)
+    txt_m_end = ft.Text("22:00", size=16, weight=ft.FontWeight.BOLD)
+
+    # カレンダーの日付ズレ（UTCの0時＝JSTの前日15時になってしまう問題）を+9時間で正確に補正
+    def on_date_change(e):
+        if e.control.value:
+            adjusted_date = e.control.value + timedelta(hours=9)
+            txt_m_date.value = adjusted_date.strftime("%Y-%m-%d")
+            page.update()
+
+    dp_manual = ft.DatePicker(on_change=on_date_change)
+    
+    # entry_mode=ft.TimePickerEntryMode.INPUT を指定して、直接入力UIをデフォルト化
+    tp_m_start = ft.TimePicker(
+        on_change=lambda e: (setattr(txt_m_start, 'value', e.control.value.strftime("%H:%M")), page.update()) if e.control.value else None, 
+        entry_mode=ft.TimePickerEntryMode.INPUT
     )
+    
+    tp_m_end = ft.TimePicker(
+        on_change=lambda e: (setattr(txt_m_end, 'value', e.control.value.strftime("%H:%M")), page.update()) if e.control.value else None, 
+        entry_mode=ft.TimePickerEntryMode.INPUT
+    )
+    
+    page.overlay.extend([dp_manual, tp_m_start, tp_m_end])
+
+    def calc_and_add_manual(e):
+        date_str, start_str, end_str = txt_m_date.value, txt_m_start.value, txt_m_end.value
+        try:
+            start_dt = datetime.strptime(f"{date_str} {start_str}", "%Y-%m-%d %H:%M")
+            end_dt = datetime.strptime(f"{date_str} {end_str}", "%Y-%m-%d %H:%M")
+            if end_dt <= start_dt: end_dt += timedelta(days=1)
+            total_seconds = int((end_dt - start_dt).total_seconds())
+            base, bonuses = settings["base_wage"], get_parsed_bonuses()
+            total_earned = sum((get_wage_at_time(datetime.fromtimestamp(start_dt.timestamp() + i).time(), base, bonuses) / 3600) for i in range(total_seconds))
+
+            if date_str not in logs or not isinstance(logs[date_str], list): logs[date_str] = []
+            
+            logs[date_str].append({
+                "start": start_str, 
+                "end": end_str, 
+                "earned": int(total_earned),
+                "seconds": total_seconds
+            })
+            save_db(db)
+            dlg_manual.open = False
+            show_msg(f"✅ {date_str} の記録を追加しました！")
+            route_change()
+        except Exception: show_msg("エラーが発生しました。時間の形式を確認してください。")
+
+    dlg_manual = ft.AlertDialog(title=ft.Text("過去のシフトを追加"), content=ft.Column([ft.Text("日付", color=ft.Colors.GREY_600), ft.TextButton(content=ft.Row([ft.Icon(ft.Icons.CALENDAR_MONTH), txt_m_date]), on_click=lambda _: setattr(dp_manual, 'open', True) or page.update()), ft.Divider(height=10, color=ft.Colors.TRANSPARENT), ft.Text("勤務時間", color=ft.Colors.GREY_600), ft.Row([ft.TextButton(content=ft.Row([ft.Icon(ft.Icons.ACCESS_TIME, size=16), txt_m_start]), on_click=lambda _: setattr(tp_m_start, 'open', True) or page.update()), ft.Text("〜"), ft.TextButton(content=ft.Row([ft.Icon(ft.Icons.ACCESS_TIME, size=16), txt_m_end]), on_click=lambda _: setattr(tp_m_end, 'open', True) or page.update())], alignment=ft.MainAxisAlignment.CENTER)], tight=True), actions=[ft.TextButton("キャンセル", on_click=lambda e: setattr(dlg_manual, 'open', False) or page.update()), ft.ElevatedButton("計算して記録", on_click=calc_and_add_manual, style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE, color=ft.Colors.WHITE))], actions_alignment=ft.MainAxisAlignment.END)
+    page.overlay.append(dlg_manual)
 
     # --- スワイプとルーティング ---
     def swipe_to_calendar(e):
         dx = e.local_delta.x if hasattr(e, "local_delta") else getattr(e, "delta_x", 0)
-        if dx > 15:
-            page.run_task(page.push_route, "/calendar")
+        if dx > 15: page.run_task(page.push_route, "/calendar")
 
     def swipe_to_home(e):
         dx = e.local_delta.x if hasattr(e, "local_delta") else getattr(e, "delta_x", 0)
-        if dx < -15:
-            page.run_task(page.push_route, "/")
+        if dx < -15: page.run_task(page.push_route, "/")
 
     def route_change(route_event=None):
         page.views.clear()
         
-        history_items = [
-            ft.ListTile(
-                leading=ft.Icon(ft.Icons.ATTACH_MONEY),
-                title=ft.Text(f"{date}", weight=ft.FontWeight.BOLD), 
-                subtitle=ft.Text(f"合計: ¥{amt:,}", color=ft.Colors.BLUE)
-            )
-            for date, amt in sorted(logs.items(), reverse=True)
-        ]
+        offset = state.get("view_month_offset", 0)
+        s_date, e_date = get_period_dates(offset)
+        
+        period_total = 0
+        period_seconds = 0.0
+        annual_total = 0
+        annual_seconds = 0.0
+        history_items = []
+        target_year = e_date.year
+        
+        for date_str, shift_list in sorted(logs.items(), reverse=True):
+            if not isinstance(shift_list, list): continue
+            log_date = datetime.strptime(date_str, "%Y-%m-%d")
+            
+            if log_date.year == target_year:
+                for s in shift_list:
+                    annual_total += s.get("earned", 0)
+                    annual_seconds += s.get("seconds", get_fallback_seconds(s.get("start"), s.get("end")))
+            
+            if s_date.date() <= log_date.date() <= e_date.date():
+                day_total = 0
+                for s in shift_list:
+                    day_total += s.get("earned", 0)
+                    period_seconds += s.get("seconds", get_fallback_seconds(s.get("start"), s.get("end")))
+                
+                period_total += day_total
+                
+                shift_tiles = [ft.ListTile(leading=ft.Icon(ft.Icons.SUBDIRECTORY_ARROW_RIGHT, size=16, color=ft.Colors.GREY_400), title=ft.Text(f"{s.get('start', '不明')} 〜 {s.get('end', '不明')}", size=14), subtitle=ft.Text(f"¥{s.get('earned', 0):,}", color=ft.Colors.BLUE, size=14), dense=True, content_padding=ft.padding.only(left=20)) for s in shift_list]
+                history_items.append(ft.Container(content=ft.Column([ft.Text(f"{date_str} (計: ¥{day_total:,})", weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_GREY_700), *shift_tiles], spacing=0), padding=10, margin=ft.margin.only(bottom=10), border=ft.border.all(1, ft.Colors.GREY_200), border_radius=8, bgcolor=ft.Colors.WHITE))
+
         if not history_items:
-            history_items.append(ft.Text("まだ記録がありません", color=ft.Colors.GREY_500))
+            history_items.append(ft.Text("この期間の記録はありません", color=ft.Colors.GREY_500))
+
+        def change_month(delta):
+            state["view_month_offset"] = state.get("view_month_offset", 0) + delta
+            save_db(db)
+            route_change()
+
+        period_str = f"{s_date.month}/{s_date.day} 〜 {e_date.month}/{e_date.day}"
+        card_title = "今月振り込まれる予定の給料" if offset == 0 else f"{abs(offset)}ヶ月前の給料"
+        
+        monthly_card = ft.Container(
+            content=ft.Row([
+                ft.IconButton(ft.Icons.CHEVRON_LEFT, icon_color=ft.Colors.WHITE, on_click=lambda e: change_month(-1)),
+                ft.Column([
+                    ft.Text(card_title, color=ft.Colors.WHITE70, size=12),
+                    ft.Text(f"¥ {int(period_total):,}", size=36, weight=ft.FontWeight.BOLD, color=ft.Colors.WHITE),
+                    ft.Row([
+                        ft.Text(f"対象期間: {period_str}", color=ft.Colors.WHITE70, size=12),
+                        ft.Text("|", color=ft.Colors.WHITE70, size=12),
+                        ft.Text(f"稼働: {format_time_str(period_seconds)}", color=ft.Colors.WHITE, size=12, weight=ft.FontWeight.BOLD),
+                    ], alignment=ft.MainAxisAlignment.CENTER),
+                    ft.Container(height=5),
+                    ft.Container(
+                        content=ft.Text(f"【{target_year}年】 ¥ {int(annual_total):,} ({format_time_str(annual_seconds)})", color=ft.Colors.WHITE, size=14, weight=ft.FontWeight.BOLD),
+                        bgcolor=ft.Colors.WHITE24,
+                        padding=ft.padding.symmetric(horizontal=10, vertical=5),
+                        border_radius=15
+                    )
+                ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, expand=True),
+                ft.IconButton(ft.Icons.CHEVRON_RIGHT, icon_color=ft.Colors.WHITE, disabled=(offset >= 0), on_click=lambda e: change_month(1))
+            ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+            bgcolor=ft.Colors.BLUE_600,
+            padding=10,
+            border_radius=10,
+            width=float('inf')
+        )
 
         page.views.append(
             ft.View(
@@ -360,13 +496,18 @@ def main(page: ft.Page):
                         expand=True,
                         content=ft.Container(
                             bgcolor=ft.Colors.TRANSPARENT,
+                            expand=True, 
                             content=ft.Column([
+                                monthly_card,
+                                ft.Divider(color=ft.Colors.TRANSPARENT, height=10),
+                                ft.ElevatedButton("過去のシフトを手動入力", icon=ft.Icons.EDIT_CALENDAR, width=250, on_click=lambda _: setattr(dlg_manual, 'open', True) or page.update(), style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE_50, color=ft.Colors.BLUE_800)),
+                                ft.Divider(),
                                 ft.Column(history_items, scroll=ft.ScrollMode.AUTO, expand=True),
                                 ft.Divider(),
                                 ft.TextButton("履歴をすべて削除", icon=ft.Icons.DELETE, on_click=clear_logs, icon_color=ft.Colors.RED, style=ft.ButtonStyle(color=ft.Colors.RED)),
                                 ft.Text("← 左スワイプでホームへ戻る", color=ft.Colors.GREY_400, size=12)
-                            ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
-                            expand=True, padding=20
+                            ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, expand=True), 
+                            padding=20
                         )
                     )
                 ]
@@ -384,14 +525,18 @@ def main(page: ft.Page):
                             expand=True,
                             content=ft.Container(
                                 bgcolor=ft.Colors.TRANSPARENT,
+                                expand=True, 
                                 content=ft.Column([
                                     ft.Text("本日の稼ぎ", size=18, color=ft.Colors.GREY_600),
                                     ft.Stack([
                                         progress_ring,
                                         ft.Container(
-                                            content=ft.Column([amount_text, current_wage_text, timer_text], horizontal_alignment=ft.CrossAxisAlignment.CENTER, alignment=ft.MainAxisAlignment.CENTER, spacing=5),
-                                            width=250, height=250, 
-                                            alignment=ft.Alignment(0, 0)
+                                            content=ft.Column([
+                                                amount_text, current_wage_text, 
+                                                ft.Row([current_wage_min_text, current_wage_sec_text], alignment=ft.MainAxisAlignment.CENTER, spacing=15),
+                                                timer_text, start_time_label
+                                            ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, alignment=ft.MainAxisAlignment.CENTER, spacing=2),
+                                            width=250, height=250, alignment=ft.Alignment(0, 0)
                                         )
                                     ]),
                                     ft.Divider(height=20, color=ft.Colors.TRANSPARENT),
@@ -399,8 +544,7 @@ def main(page: ft.Page):
                                     ft.Divider(height=20, color=ft.Colors.TRANSPARENT),
                                     btn_finish,
                                     ft.Text("右スワイプで履歴を確認 →", color=ft.Colors.GREY_400, size=12)
-                                ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, alignment=ft.MainAxisAlignment.CENTER),
-                                expand=True, 
+                                ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, alignment=ft.MainAxisAlignment.CENTER, expand=True),
                                 alignment=ft.Alignment(0, 0)
                             )
                         )
@@ -408,16 +552,15 @@ def main(page: ft.Page):
                     drawer=my_drawer
                 )
             )
-            
         page.update()
 
     page.on_route_change = route_change
     page.route = page.route if page.route else "/"
     route_change()
-
+    
+    # スレッドを起動（何があっても死なないように設計済み）
     threading.Thread(target=update_timer, daemon=True).start()
 
 if __name__ == "__main__":
-    # Renderが指定するポート番号を読み込み、なければ8550を使う
-    port = int(os.getenv("PORT", 8550))
-    ft.run(main, host="0.0.0.0", port=port)
+    app_port = int(os.getenv("PORT", 8550))
+    ft.run(main, host="0.0.0.0", port=app_port)
