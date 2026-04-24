@@ -6,6 +6,9 @@ import os
 import calendar
 from datetime import datetime, timedelta
 
+os.environ['TZ'] = 'Asia/Tokyo'
+time.tzset()
+
 # データを保存するファイル名
 DATA_FILE = "time_wage_data.json"
 
